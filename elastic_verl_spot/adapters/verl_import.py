@@ -34,5 +34,14 @@ def configure_verl_path() -> None:
 def import_verl():
     """Import and return the resolved verl module."""
     configure_verl_path()
-    return importlib.import_module("verl")
-
+    try:
+        return importlib.import_module("verl")
+    except ModuleNotFoundError as exc:
+        if exc.name != "verl":
+            raise
+        message = (
+            "Could not import verl. Run this project in the compute-platform "
+            "environment where verl==0.9.0.dev is already installed, or set "
+            "VERL_SOURCE_DIR to the existing platform verl source directory."
+        )
+        raise ModuleNotFoundError(message) from exc
