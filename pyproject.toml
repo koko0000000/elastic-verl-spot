@@ -1,0 +1,11 @@
+[project]
+name = "elastic-verl-spot"
+version = "0.1.0"
+description = "Spot-aware elastic execution layer for verl GRPO on H200 clusters."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["elastic_verl_spot*"]
+
