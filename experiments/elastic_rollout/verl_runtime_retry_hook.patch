@@ -1,0 +1,388 @@
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index dc3f341..2c46229 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -136,6 +136,24 @@ trainer:
+   # Directory for logging rollout data; no dump if null
+   rollout_data_dir: null
+ 
++  # First-stage elastic rollout switch. This keeps verl's native rollout data
++  # path unchanged and only records request-level events around generation.
++  elastic_rollout:
++    enable: false
++    event_log_path: null
++    dry_run_fail_worker_id: rollout-0
++    dry_run_fail_after_dispatches: -1
++    fault_injection_enable: false
++    fault_injection_step: -1
++    fault_injection_after_dispatches: -1
++    fault_injection_server_index: 0
++    fault_injection_no_restart: true
++    fault_injection_mode: pre_generate
++    fault_injection_delay_sec: 0.5
++    request_retry_enable: true
++    request_retry_max_attempts: 2
++    request_retry_backoff_sec: 0.2
++
+   # Directory for logging validation data; no dump if null
+   validation_data_dir: null
+ 
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index e85d302..de37708 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -19,8 +19,10 @@ Utility classes for manage and request LLM servers:
+ """
+ 
+ import asyncio
++import json
+ import logging
+ import os
++import time
+ from typing import Any, Optional
+ from uuid import uuid4
+ 
+@@ -75,6 +77,9 @@ class GlobalRequestLoadBalancer:
+         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
+         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+         self._full_determinism = full_determinism
++        self._runtime_fault_config: dict[str, Any] | None = None
++        self._runtime_fault_dispatches = 0
++        self._runtime_fault_result: dict[str, Any] | None = None
+ 
+     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+         """Acquire a server for the given request (sticky + least-loaded).
+@@ -144,6 +149,86 @@ class GlobalRequestLoadBalancer:
+             self._servers.pop(sid, None)
+         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
+ 
++    def kill_server(self, server_id: str, no_restart: bool = True) -> dict:
++        """Remove and kill one rollout server actor for fault injection."""
++
++        handle = self._servers.pop(server_id, None)
++        self._inflight_requests.pop(server_id, None)
++        if handle is None:
++            return {
++                "server_id": server_id,
++                "killed": False,
++                "reason": "server_not_found",
++                "active_servers": list(self._inflight_requests.keys()),
++            }
++
++        ray.kill(handle, no_restart=no_restart)
++        logger.warning(f"[GlobalLoadBalancer] killed rollout server {server_id}")
++        return {
++            "server_id": server_id,
++            "killed": True,
++            "no_restart": no_restart,
++            "active_servers": list(self._inflight_requests.keys()),
++        }
++
++    def configure_runtime_fault_injection(
++        self,
++        *,
++        server_id: str,
++        after_dispatches: int,
++        delay_sec: float = 0.5,
++        no_restart: bool = True,
++    ) -> dict:
++        """Configure one delayed kill after real request dispatch begins."""
++
++        self._runtime_fault_config = {
++            "server_id": server_id,
++            "after_dispatches": after_dispatches,
++            "delay_sec": delay_sec,
++            "no_restart": no_restart,
++            "armed": True,
++        }
++        self._runtime_fault_dispatches = 0
++        self._runtime_fault_result = None
++        return {
++            "configured": True,
++            "server_id": server_id,
++            "after_dispatches": after_dispatches,
++            "delay_sec": delay_sec,
++            "no_restart": no_restart,
++        }
++
++    async def maybe_inject_runtime_fault(self, request_id: str, server_id: str) -> dict | None:
++        """Maybe kill the configured rollout server after a real dispatch."""
++
++        config = self._runtime_fault_config
++        if not config or not config.get("armed", False):
++            return None
++
++        self._runtime_fault_dispatches += 1
++        if self._runtime_fault_dispatches != int(config["after_dispatches"]):
++            return None
++
++        config["armed"] = False
++        await asyncio.sleep(float(config.get("delay_sec", 0.5)))
++        target_server_id = str(config["server_id"])
++        result = self.kill_server(server_id=target_server_id, no_restart=bool(config.get("no_restart", True)))
++        result.update(
++            {
++                "request_id": request_id,
++                "dispatch_server_id": server_id,
++                "after_dispatches": self._runtime_fault_dispatches,
++                "runtime": True,
++            }
++        )
++        self._runtime_fault_result = result
++        return result
++
++    def get_runtime_fault_result(self) -> dict | None:
++        """Return the last runtime fault result."""
++
++        return self._runtime_fault_result
++
+     def get_inflight_count(self, server_id: str) -> int:
+         """Get number of in-flight requests for a server."""
+         return self._inflight_requests.get(server_id, 0)
+@@ -186,6 +271,40 @@ class LLMServerClient:
+         self.config = config
+         self._load_balancer = load_balancer_handle
+ 
++    def _elastic_rollout_cfg(self):
++        trainer_cfg = getattr(self.config, "trainer", None)
++        if trainer_cfg is None:
++            return None
++        return getattr(trainer_cfg, "elastic_rollout", None)
++
++    def _elastic_cfg_get(self, key: str, default: Any = None) -> Any:
++        cfg = self._elastic_rollout_cfg()
++        if cfg is None:
++            return default
++        get = getattr(cfg, "get", None)
++        if callable(get):
++            return get(key, default)
++        return getattr(cfg, key, default)
++
++    def _elastic_retry_enabled(self) -> bool:
++        mode = str(self._elastic_cfg_get("fault_injection_mode", "pre_generate"))
++        return bool(self._elastic_cfg_get("request_retry_enable", mode == "runtime"))
++
++    def _emit_elastic_event(self, event_type: str, **fields: Any) -> None:
++        event_log_path = self._elastic_cfg_get("event_log_path", None)
++        if not event_log_path:
++            return
++        record = {
++            "event_type": event_type,
++            "ts": time.time(),
++            **fields,
++        }
++        try:
++            with open(event_log_path, "a", encoding="utf-8") as f:
++                f.write(json.dumps(record, ensure_ascii=False) + "\n")
++        except Exception:
++            logger.exception("failed to write elastic rollout event")
++
+     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
+         server_id, handle = await self._load_balancer.acquire_server.remote(request_id=request_id)
+@@ -219,34 +338,92 @@ class LLMServerClient:
+         Returns:
+             TokenOutput | DiffusionOutput: token or diffusion output
+         """
+-        server_id, server = await self._acquire_server(request_id)
+-        try:
+-            multimodal_kwargs = {}
+-            if audio_data is not None:
+-                multimodal_kwargs["audio_data"] = audio_data
+-            if mm_processor_kwargs:
+-                multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+-            # priority is only supported by vLLM rollout server.
+-            priority = kwargs.pop("priority", 0)
+-            priority_kwargs = (
+-                {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+-            )
+-            output: TokenOutput = await server.generate.remote(
+-                request_id=uuid4().hex,  # use new request_id for each turn
+-                prompt_ids=prompt_ids,
+-                sampling_params=sampling_params,
+-                image_data=image_data,
+-                video_data=video_data,
+-                **multimodal_kwargs,
+-                **priority_kwargs,
+-                **kwargs,
++        max_attempts = int(self._elastic_cfg_get("request_retry_max_attempts", 2))
++        retry_backoff_sec = float(self._elastic_cfg_get("request_retry_backoff_sec", 0.2))
++        retry_enabled = self._elastic_retry_enabled()
++        # priority is only supported by vLLM rollout server. Keep it stable across retries.
++        priority = kwargs.pop("priority", 0)
++        attempt = 0
++        last_error = None
++
++        while True:
++            attempt += 1
++            server_id, server = await self._acquire_server(request_id)
++            self._emit_elastic_event(
++                "request_running",
++                request_id=str(request_id),
++                worker_id=server_id,
++                attempt=attempt,
++                retried=attempt > 1,
+             )
+-            global_steps = output.extra_fields.get("global_steps")
+-            output.extra_fields.setdefault("min_global_steps", global_steps)
+-            output.extra_fields.setdefault("max_global_steps", global_steps)
+-            return output
+-        finally:
+-            self._release_server(server_id)
++            try:
++                multimodal_kwargs = {}
++                if audio_data is not None:
++                    multimodal_kwargs["audio_data"] = audio_data
++                if mm_processor_kwargs:
++                    multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
++                priority_kwargs = (
++                    {"priority": priority}
++                    if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm"
++                    else {}
++                )
++                self._load_balancer.maybe_inject_runtime_fault.remote(
++                    request_id=str(request_id),
++                    server_id=server_id,
++                )
++                output: TokenOutput = await server.generate.remote(
++                    request_id=uuid4().hex,  # use new request_id for each turn
++                    prompt_ids=prompt_ids,
++                    sampling_params=sampling_params,
++                    image_data=image_data,
++                    video_data=video_data,
++                    **multimodal_kwargs,
++                    **priority_kwargs,
++                    **kwargs,
++                )
++                global_steps = output.extra_fields.get("global_steps")
++                output.extra_fields.setdefault("min_global_steps", global_steps)
++                output.extra_fields.setdefault("max_global_steps", global_steps)
++                if attempt > 1:
++                    self._emit_elastic_event(
++                        "request_retry_done",
++                        request_id=str(request_id),
++                        worker_id=server_id,
++                        attempt=attempt,
++                        retried=True,
++                        token_count=len(output.token_ids or []),
++                    )
++                return output
++            except Exception as exc:
++                last_error = repr(exc)
++                self._emit_elastic_event(
++                    "partial_response_saved",
++                    request_id=str(request_id),
++                    worker_id=server_id,
++                    attempt=attempt,
++                    partial_tokens=0,
++                    reason=last_error,
++                )
++                if not retry_enabled or attempt >= max_attempts:
++                    self._emit_elastic_event(
++                        "request_retry_failed",
++                        request_id=str(request_id),
++                        worker_id=server_id,
++                        attempt=attempt,
++                        error=last_error,
++                    )
++                    raise
++                self._emit_elastic_event(
++                    "request_retry_queued",
++                    request_id=str(request_id),
++                    failed_worker_id=server_id,
++                    attempt=attempt,
++                    next_attempt=attempt + 1,
++                    error=last_error,
++                )
++                await asyncio.sleep(retry_backoff_sec)
++            finally:
++                self._release_server(server_id)
+ 
+ 
+ class FullyAsyncLLMServerClient(LLMServerClient):
+@@ -495,6 +672,71 @@ class LLMServerManager:
+         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
+         return self.server_addresses
+ 
++    @auto_await
++    async def kill_server_for_fault_injection(self, server_index: int = 0, no_restart: bool = True) -> dict:
++        """Kill one rollout server replica through the load balancer.
++
++        This is a test hook. Without higher-level retry/rebuild, the current
++        training step may fail after the injected rollout server death.
++        """
++
++        if not self.server_addresses:
++            return {"killed": False, "reason": "no_servers"}
++        if server_index < 0 or server_index >= len(self.server_addresses):
++            return {
++                "killed": False,
++                "reason": "server_index_out_of_range",
++                "server_index": server_index,
++                "num_servers": len(self.server_addresses),
++            }
++
++        server_id = self.server_addresses[server_index]
++        result = await self.global_load_balancer.kill_server.remote(server_id=server_id, no_restart=no_restart)
++        result["server_index"] = server_index
++        return result
++
++    @auto_await
++    async def configure_runtime_fault_injection(
++        self,
++        server_index: int = 0,
++        after_dispatches: int = 1,
++        delay_sec: float = 0.5,
++        no_restart: bool = True,
++    ) -> dict:
++        """Arm a delayed server kill that fires after real request dispatch starts."""
++
++        if not self.server_addresses:
++            return {"configured": False, "reason": "no_servers"}
++        if server_index < 0 or server_index >= len(self.server_addresses):
++            return {
++                "configured": False,
++                "reason": "server_index_out_of_range",
++                "server_index": server_index,
++                "num_servers": len(self.server_addresses),
++            }
++
++        server_id = self.server_addresses[server_index]
++        result = await self.global_load_balancer.configure_runtime_fault_injection.remote(
++            server_id=server_id,
++            after_dispatches=after_dispatches,
++            delay_sec=delay_sec,
++            no_restart=no_restart,
++        )
++        result["server_index"] = server_index
++        return result
++
++    @auto_await
++    async def get_runtime_fault_result(self) -> dict | None:
++        """Return the delayed server kill result if runtime injection has fired."""
++
++        result = await self.global_load_balancer.get_runtime_fault_result.remote()
++        if result is None:
++            return None
++        server_id = result.get("server_id")
++        if server_id in self.server_addresses:
++            result["server_index"] = self.server_addresses.index(server_id)
++        return result
++
+    def get_replicas(self) -> list[RolloutReplica]:
+        """Get the LLM server replicas."""
+        return self.rollout_replicas
+diff --git a/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh b/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
+--- a/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
++++ b/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
+@@ -72,6 +72,11 @@ python3 -u -m verl.trainer.main_ppo \
+   trainer.elastic_rollout.fault_injection_after_dispatches="${FAULT_INJECTION_AFTER_DISPATCHES:--1}" \
+   trainer.elastic_rollout.fault_injection_server_index="${FAULT_INJECTION_SERVER_INDEX:-0}" \
+   trainer.elastic_rollout.fault_injection_no_restart="${FAULT_INJECTION_NO_RESTART:-true}" \
++  trainer.elastic_rollout.fault_injection_mode="${FAULT_INJECTION_MODE:-pre_generate}" \
++  trainer.elastic_rollout.fault_injection_delay_sec="${FAULT_INJECTION_DELAY_SEC:-0.5}" \
++  trainer.elastic_rollout.request_retry_enable="${REQUEST_RETRY_ENABLE:-true}" \
++  trainer.elastic_rollout.request_retry_max_attempts="${REQUEST_RETRY_MAX_ATTEMPTS:-2}" \
++  trainer.elastic_rollout.request_retry_backoff_sec="${REQUEST_RETRY_BACKOFF_SEC:-0.2}" \
+   trainer.resume_mode=disable \
+   "$@"

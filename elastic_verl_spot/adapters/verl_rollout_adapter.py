@@ -163,6 +163,8 @@ def generate_sequences_with_elastic_events(
     fault_injection_after = int(_get_cfg(elastic_config, "fault_injection_after_dispatches", -1))
     fault_injection_server_index = int(_get_cfg(elastic_config, "fault_injection_server_index", 0))
     fault_injection_no_restart = bool(_get_cfg(elastic_config, "fault_injection_no_restart", True))
+    fault_injection_mode = str(_get_cfg(elastic_config, "fault_injection_mode", "pre_generate"))
+    fault_injection_delay_sec = float(_get_cfg(elastic_config, "fault_injection_delay_sec", 0.5))
     should_inject_fault = fault_injection_enable and (
         fault_injection_step < 0 or fault_injection_step == global_steps
     )
@@ -198,6 +200,7 @@ def generate_sequences_with_elastic_events(
                 request_id=request_id,
                 server_index=fault_injection_server_index,
                 after_dispatches=fault_injection_after,
+                mode=fault_injection_mode,
             )
             if fault_manager is None:
                 logger.emit(
@@ -208,21 +211,34 @@ def generate_sequences_with_elastic_events(
                 )
             else:
                 try:
-                    kill_result = fault_manager.kill_server_for_fault_injection(
-                        server_index=fault_injection_server_index,
-                        no_restart=fault_injection_no_restart,
-                    )
-                    logger.emit("worker_killed", global_steps=global_steps, **kill_result)
-                    remove_result = remove_replica_from_checkpoint_manager(
-                        fault_manager=fault_manager,
-                        checkpoint_manager=checkpoint_manager,
-                        kill_result=kill_result,
-                    )
-                    logger.emit(
-                        "checkpoint_replica_removed",
-                        global_steps=global_steps,
-                        **remove_result,
-                    )
+                    if fault_injection_mode == "runtime":
+                        configured = fault_manager.configure_runtime_fault_injection(
+                            server_index=fault_injection_server_index,
+                            after_dispatches=fault_injection_after,
+                            delay_sec=fault_injection_delay_sec,
+                            no_restart=fault_injection_no_restart,
+                        )
+                        logger.emit(
+                            "worker_kill_configured_runtime",
+                            global_steps=global_steps,
+                            **configured,
+                        )
+                    else:
+                        kill_result = fault_manager.kill_server_for_fault_injection(
+                            server_index=fault_injection_server_index,
+                            no_restart=fault_injection_no_restart,
+                        )
+                        logger.emit("worker_killed", global_steps=global_steps, **kill_result)
+                        remove_result = remove_replica_from_checkpoint_manager(
+                            fault_manager=fault_manager,
+                            checkpoint_manager=checkpoint_manager,
+                            kill_result=kill_result,
+                        )
+                        logger.emit(
+                            "checkpoint_replica_removed",
+                            global_steps=global_steps,
+                            **remove_result,
+                        )
                 except Exception as exc:
                     logger.emit(
                         "worker_kill_failed",
@@ -246,6 +262,21 @@ def generate_sequences_with_elastic_events(
         )
         raise
     elapsed_sec = time.time() - started_at
+
+    if should_inject_fault and fault_injection_mode == "runtime" and fault_manager is not None:
+        kill_result = fault_manager.get_runtime_fault_result()
+        if kill_result and kill_result.get("killed", False):
+            logger.emit("worker_killed", global_steps=global_steps, **kill_result)
+            remove_result = remove_replica_from_checkpoint_manager(
+                fault_manager=fault_manager,
+                checkpoint_manager=checkpoint_manager,
+                kill_result=kill_result,
+            )
+            logger.emit(
+                "checkpoint_replica_removed",
+                global_steps=global_steps,
+                **remove_result,
+            )
 
     completed_count = len(output)
     done_request_ids = request_ids[:completed_count]
@@ -285,4 +316,3 @@ def generate_sequences_with_elastic_events(
     output.meta_info.setdefault("timing", {})
     output.meta_info["timing"]["elastic_rollout_shim"] = elapsed_sec
     return output
-
