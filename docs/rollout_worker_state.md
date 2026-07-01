@@ -1,4 +1,3 @@
-```markdown
 # Rollout Worker 状态机
 
 ## 1. 目标
@@ -158,4 +157,3 @@ checkpoint manager 负责 rollout worker 的 `sleep / wake / update_weights`。
 - 故障后严格的权重重新同步
 
 后续功能需要基于该状态机继续实现。
-```
