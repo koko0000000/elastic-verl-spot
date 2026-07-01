@@ -1,0 +1,27 @@
+﻿diff --git a/verl/trainer/ppo/elastic_rollout.py b/verl/trainer/ppo/elastic_rollout.py
+new file mode 100644
+index 0000000..05a5d07
+--- /dev/null
++++ b/verl/trainer/ppo/elastic_rollout.py
+@@ -0,0 +1,21 @@
++"""Thin vendored verl hook for elastic rollout.
++
++The implementation lives in ``elastic_verl_spot.adapters.verl_rollout_adapter``.
++This file only makes the outer project importable when running from the vendored
++verl tree and re-exports the hook function expected by ``ray_trainer.py``.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++for _parent in Path(__file__).resolve().parents:
++    if (_parent / "elastic_verl_spot").is_dir():
++        sys.path.insert(0, str(_parent))
++        break
++
++from elastic_verl_spot.adapters.verl_rollout_adapter import generate_sequences_with_elastic_events
++
++__all__ = ["generate_sequences_with_elastic_events"]
++
