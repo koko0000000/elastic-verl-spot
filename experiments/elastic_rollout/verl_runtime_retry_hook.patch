@@ -369,13 +369,13 @@ index e85d302..de37708 100644
 +            result["server_index"] = self.server_addresses.index(server_id)
 +        return result
 +
-    def get_replicas(self) -> list[RolloutReplica]:
-        """Get the LLM server replicas."""
-        return self.rollout_replicas
+     def get_replicas(self) -> list[RolloutReplica]:
+         """Get the LLM server replicas."""
+         return self.rollout_replicas
 diff --git a/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh b/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
 --- a/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
 +++ b/elastic_spot_experiments/run_4node_h100_grpo_elastic_observed.sh
-@@ -72,6 +72,11 @@ python3 -u -m verl.trainer.main_ppo \
+@@ -72,5 +72,10 @@ python3 -u -m verl.trainer.main_ppo \
    trainer.elastic_rollout.fault_injection_after_dispatches="${FAULT_INJECTION_AFTER_DISPATCHES:--1}" \
    trainer.elastic_rollout.fault_injection_server_index="${FAULT_INJECTION_SERVER_INDEX:-0}" \
    trainer.elastic_rollout.fault_injection_no_restart="${FAULT_INJECTION_NO_RESTART:-true}" \
