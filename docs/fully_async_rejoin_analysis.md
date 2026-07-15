@@ -418,3 +418,52 @@ python -m pytest tests -q
 The next integration step is to make the thin verl fully-async hook call this
 manager when `set_rollout_replica_enabled()` or `scale_up_rollout_replicas()` is
 invoked.
+
+## 12. Runtime Hook Patch
+
+The real verl fully-async runtime controls can now be connected with:
+
+```text
+experiments/fully_async_rejoin_reference/install_fully_async_lifecycle_hook.py
+```
+
+Apply order on the server:
+
+```bash
+cd /inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/elastic-verl-spot
+git pull --rebase origin main
+
+cd /inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/verl
+git apply /inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/elastic-verl-spot/experiments/fully_async_rejoin_reference/add_trace.20260708.patch
+python /inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/elastic-verl-spot/experiments/fully_async_rejoin_reference/install_fully_async_lifecycle_hook.py --verl-root .
+```
+
+The runtime hook records lifecycle events from:
+
+```text
+FullyAsyncRollouter.set_rollout_replica_enabled()
+FullyAsyncRollouter.scale_up_replicas()
+FullyAsyncRollouter.get_rollout_control_state()
+FullyAsyncTrainer.scale_up_rollout_replicas()
+```
+
+Set the event log path before running fully async training:
+
+```bash
+export PYTHONPATH=/inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/elastic-verl-spot:$PYTHONPATH
+export ELASTIC_ROLLOUT_EVENT_LOG_PATH=/inspire/hdd/project/ruanyinyitihua/czxs253130626/klg/elastic-verl-spot/experiments/fully_async_rejoin_reference/fully_async_lifecycle_events.jsonl
+```
+
+Expected lifecycle events:
+
+```text
+rollout_replicas_registered
+worker_disabled
+checkpoint_replica_removed
+load_balancer_updated
+worker_rebuilding
+checkpoint_weight_synced
+worker_rejoined
+rollout_replicas_scaled_up
+rollout_model_version_updated
+```
