@@ -1,0 +1,106 @@
+下载https://github.com/volcengine/verl.git(tag v0.7.1)
+在仓库根目录下，通过git apply add_trace.20260708.patch修改源代码
+control_rollouter.py直接放到scripts下
+暂停/恢复/扩容命令如下
+python3 control_rollouter.py replica --id 0 --enabled false
+
+{
+  "disabled_replica_ids": [
+    0
+  ],
+  "num_active_replicas": 1,
+  "num_total_replicas": 2,
+  "num_workers": 8,
+  "paused": true,
+  "replica_enabled": false,
+  "replica_id": 0,
+  "rollout_enabled": true
+}
+
+python3 control_rollouter.py status
+
+{
+  "active_replica_ids": [
+    1
+  ],
+  "disabled_replica_ids": [
+    0
+  ],
+  "max_concurrent_samples": 16,
+  "num_active_replicas": 1,
+  "num_total_replicas": 2,
+  "paused": true,
+  "rollout_enabled": true
+}
+
+python3 control_rollouter.py replica --id 0 --enabled true
+
+{
+  "disabled_replica_ids": [],
+  "num_active_replicas": 2,
+  "num_total_replicas": 2,
+  "num_workers": 8,
+  "paused": true,
+  "replica_enabled": true,
+  "replica_id": 0,
+  "rollout_enabled": true
+}
+
+python3 control_rollouter.py status
+
+{
+  "active_replica_ids": [
+    0,
+    1
+  ],
+  "disabled_replica_ids": [],
+  "max_concurrent_samples": 17,
+  "num_active_replicas": 2,
+  "num_total_replicas": 2,
+  "paused": true,
+  "rollout_enabled": true
+}
+
+python3 control_rollouter.py status
+
+{
+  "active_replica_ids": [
+    0
+  ],
+  "disabled_replica_ids": [],
+  "max_concurrent_samples": 16,
+  "num_active_replicas": 1,
+  "num_total_replicas": 1,
+  "paused": true,
+  "rollout_enabled": true
+}
+
+python3 scripts/control_rollouter.py scale-up --num-replicas 1
+{
+  "current_param_version": 16,
+  "max_concurrent_samples": 17,
+  "new_replica_ids": [
+    1
+  ],
+  "num_active_replicas": 2,
+  "num_total_checkpoint_replicas": 2,
+  "num_total_replicas": 2,
+  "num_workers": 8,
+  "paused": true,
+  "rollout_enabled": true
+}
+
+python3 control_rollouter.py status
+
+{
+  "active_replica_ids": [
+    0,
+    1
+  ],
+  "disabled_replica_ids": [],
+  "max_concurrent_samples": 17,
+  "num_active_replicas": 2,
+  "num_total_replicas": 2,
+  "paused": true,
+  "rollout_enabled": true
+}

@@ -1,0 +1,669 @@
+diff --git a/verl/checkpoint_engine/nixl_checkpoint_engine.py b/verl/checkpoint_engine/nixl_checkpoint_engine.py
+index fbdefc5b..879877bb 100644
+--- a/verl/checkpoint_engine/nixl_checkpoint_engine.py
++++ b/verl/checkpoint_engine/nixl_checkpoint_engine.py
+@@ -281,6 +281,14 @@ class NIXLCheckpointEngine(CheckpointEngine):
+ 
+     @classmethod
+     def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
++        # Edge case: when rollout_world_size == 1, the only rollout rank is the tail rank,
++        # so it should not have a next_agent. The generic slice would accidentally include
++        # trainer metadata and break length/world assumptions.
++        if rollout_world_size == 1:
++            rollout_next_agent_metadata = [None]
++        else:
++            rollout_next_agent_metadata = metadata[-rollout_world_size + 1 :] + [None]
++
+         trainer_kwargs = {
+             "method": ["init_process_group"] * trainer_world_size,
+             "rank": [0] + [-1] * (trainer_world_size - 1),
+@@ -294,7 +302,7 @@ class NIXLCheckpointEngine(CheckpointEngine):
+             "rank": list(range(1, rollout_world_size + 1)),
+             "world_size": [rollout_world_size + 1] * rollout_world_size,
+             "prev_agent_metadata": [metadata[0]] + metadata[-rollout_world_size:-1],
+-            "next_agent_metadata": metadata[-rollout_world_size + 1 :] + [None],
++            "next_agent_metadata": rollout_next_agent_metadata,
+         }
+         return trainer_kwargs, rollout_kwargs
+ 
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 8879960f..de6b2982 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -87,6 +87,26 @@ class GlobalRequestLoadBalancer:
+             raise ValueError(f"Release called with no inflight requests on server {server_id}")
+         self._inflight_requests[server_id] -= 1
+ 
++    def update_servers(self, server_actor_ids: list[str]) -> dict[str, int]:
++        """Update active server list while preserving inflight counts for unchanged servers."""
++        if not server_actor_ids:
++            raise ValueError("server_actor_ids must be non-empty")
++
++        new_ids = set(server_actor_ids)
++        # Keep inflight counters for surviving servers, initialize new servers with 0.
++        self._inflight_requests = {sid: self._inflight_requests.get(sid, 0) for sid in server_actor_ids}
++
++        # Drop sticky mappings pointing to removed servers.
++        stale_request_ids = [rid for rid, sid in self._request_id_to_server.items() if sid not in new_ids]
++        for rid in stale_request_ids:
++            del self._request_id_to_server[rid]
++
++        return {
++            "num_servers": len(self._inflight_requests),
++            "num_sticky_entries": len(self._request_id_to_server),
++            "num_removed_sticky_entries": len(stale_request_ids),
++        }
++
+ 
+ def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictConfig]:
+     # TODO: backward compatibility, remove this once we switch to new trainer.
+@@ -132,6 +152,15 @@ class AsyncLLMServerManager:
+         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
+         self._load_balancer.release_server.remote(server_id=server_id)
+ 
++    def update_servers(
++        self,
++        servers: list[tuple[str, ray.actor.ActorHandle]],
++        load_balancer_handle: ray.actor.ActorHandle,
++    ) -> None:
++        """Replace server set and load balancer used by this worker."""
++        self._load_balancer = load_balancer_handle
++        self._server_id_to_handle = dict(servers)
++
+     @rollout_trace_op
+     async def generate(
+         self,
+@@ -153,14 +182,28 @@ class AsyncLLMServerManager:
+             TokenOutput: token output
+         """
+         server_id, server = await self._acquire_server(request_id)
++        backend_request_id = uuid4().hex
+         try:
+             output: TokenOutput = await server.generate.remote(
+-                request_id=uuid4().hex,  # use new request_id for each turn
++                request_id=backend_request_id,
+                 prompt_ids=prompt_ids,
+                 sampling_params=sampling_params,
+                 image_data=image_data,
+                 video_data=video_data,
+             )
++            output.extra_fields = dict(output.extra_fields or {})
++            output.extra_fields["rollout_server_id"] = server_id
++            output.extra_fields["rollout_request_id"] = request_id
++            output.extra_fields["rollout_backend_request_id"] = backend_request_id
++            logger.info(
++                "[AsyncLLMServerManager] server=%s request_id=%s backend_request_id=%s prompt_tokens=%d response_tokens=%d stop_reason=%s",
++                server_id,
++                request_id,
++                backend_request_id,
++                len(prompt_ids),
++                len(output.token_ids),
++                output.stop_reason,
++            )
+             return output
+         finally:
+             self._release_server(server_id)
+@@ -532,6 +575,20 @@ class AgentLoopWorker:
+ 
+         return output
+ 
++    def update_servers(
++        self,
++        servers: list[tuple[str, ray.actor.ActorHandle]],
++        load_balancer_handle: ray.actor.ActorHandle,
++    ):
++        """Hot-update server routing set for this worker."""
++        self.server_manager.update_servers(servers=servers, load_balancer_handle=load_balancer_handle)
++
++    @staticmethod
++    def _truncate_log_text(text: str, max_chars: int = 240) -> str:
++        if len(text) <= max_chars:
++            return text
++        return text[:max_chars] + "..."
++
+     async def _run_agent_loop(
+         self,
+         sampling_params: dict[str, Any],
+@@ -569,6 +626,29 @@ class AgentLoopWorker:
+     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
+         """Perform post-processing operations on the output of each individual agent loop."""
+         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
++        if kwargs.get("rollout_trace_id") is not None:
++            output.extra_fields["rollout_trace_id"] = kwargs["rollout_trace_id"]
++
++        server_id = output.extra_fields.get("rollout_server_id")
++        request_id = output.extra_fields.get("rollout_request_id")
++        backend_request_id = output.extra_fields.get("rollout_backend_request_id")
++        trace_id = output.extra_fields.get("rollout_trace_id")
++        try:
++            prompt_text = self.tokenizer.decode(output.prompt_ids, skip_special_tokens=True)
++            response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
++        except Exception:
++            prompt_text = f"<decode_failed prompt_len={len(output.prompt_ids)}>"
++            response_text = f"<decode_failed response_len={len(output.response_ids)}>"
++
++        logger.info(
++            "[AgentLoopWorker] server_id=%s request_id=%s backend_request_id=%s trace_id=%s prompt=%s response=%s",
++            server_id,
++            request_id,
++            backend_request_id,
++            trace_id,
++            self._truncate_log_text(prompt_text),
++            self._truncate_log_text(response_text),
++        )
+ 
+         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
+ 
+@@ -1020,6 +1100,71 @@ class AgentLoopManager:
+                 )
+             )
+ 
++    async def update_active_replicas(self, active_replica_indices: list[int]) -> dict[str, int]:
++        """Update routing to a subset of rollout replicas without recreating workers."""
++        if not active_replica_indices:
++            raise ValueError("active_replica_indices must be non-empty")
++
++        # Deduplicate and validate indices to make API robust to caller mistakes.
++        replica_count = len(self.rollout_replicas)
++        dedup_indices = sorted(set(active_replica_indices))
++        for idx in dedup_indices:
++            if idx < 0 or idx >= replica_count:
++                raise ValueError(f"replica index out of range: {idx}, valid=[0, {replica_count - 1}]")
++
++        servers = [
++            (self.server_addresses[idx], self.server_handles[idx])
++            for idx in dedup_indices
++        ]
++        active_server_ids = [sid for sid, _ in servers]
++
++        await self.global_load_balancer.update_servers.remote(active_server_ids)
++        await asyncio.gather(
++            *[
++                worker.update_servers.remote(servers, self.global_load_balancer)
++                for worker in self.agent_loop_workers
++            ]
++        )
++
++        return {
++            "num_active_replicas": len(dedup_indices),
++            "num_total_replicas": replica_count,
++            "num_workers": len(self.agent_loop_workers),
++        }
++
++    async def add_replicas(self, num_replicas: int = 1) -> dict[str, Any]:
++        """Dynamically add rollout replicas and refresh routing.
++
++        New replicas are created as standalone rollout servers so existing rollout
++        worker groups do not need to be rebuilt.
++        """
++        if num_replicas <= 0:
++            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
++
++        start_idx = len(self.rollout_replicas)
++        new_replicas = []
++        for offset in range(num_replicas):
++            replica_rank = start_idx + offset
++            replica = self.rollout_replica_class(
++                replica_rank=replica_rank,
++                config=self.rollout_config,
++                model_config=self.model_config,
++                gpus_per_node=self.rollout_config.n_gpus_per_node,
++            )
++            await replica.init_standalone()
++            new_replicas.append(replica)
++
++        self.rollout_replicas.extend(new_replicas)
++        self.server_handles.extend([replica.server_handle for replica in new_replicas])
++        self.server_addresses.extend([replica.server_address for replica in new_replicas])
++
++        if self.rollout_config.prometheus.enable:
++            update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
++
++        routing_stats = await self.update_active_replicas(list(range(len(self.rollout_replicas))))
++        routing_stats["new_replica_ids"] = list(range(start_idx, start_idx + num_replicas))
++        return routing_stats
++
+     async def _init_global_load_balancer(self) -> None:
+         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+             server_actor_ids=self.server_addresses,
+diff --git a/verl/experimental/agent_loop/single_turn_agent_loop.py b/verl/experimental/agent_loop/single_turn_agent_loop.py
+index d45082f5..d55da016 100644
+--- a/verl/experimental/agent_loop/single_turn_agent_loop.py
++++ b/verl/experimental/agent_loop/single_turn_agent_loop.py
+@@ -35,6 +35,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
+ 
+     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+         messages = list(kwargs["raw_prompt"])
++        request_id = kwargs.get("rollout_trace_id") or uuid4().hex
+ 
+         # 1. extract images and videos from messages
+         multi_modal_data = await self.process_vision_info(messages)
+@@ -52,7 +53,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
+         metrics = {}
+         with simple_timer("generate_sequences", metrics):
+             output: TokenOutput = await self.server_manager.generate(
+-                request_id=uuid4().hex,
++                request_id=request_id,
+                 prompt_ids=prompt_ids,
+                 sampling_params=sampling_params,
+                 image_data=images,
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+index 308ef499..58a26110 100644
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -130,7 +130,7 @@ class ToolAgentLoop(AgentLoopBase):
+         videos = multi_modal_data.get("videos")
+ 
+         metrics = {}
+-        request_id = uuid4().hex
++        request_id = kwargs.get("rollout_trace_id") or uuid4().hex
+         tools_kwargs = kwargs.get("tools_kwargs", {})
+ 
+         # Initialize interaction if needed
+diff --git a/verl/experimental/fully_async_policy/fully_async_main.py b/verl/experimental/fully_async_policy/fully_async_main.py
+index 18b2eddb..13014dea 100644
+--- a/verl/experimental/fully_async_policy/fully_async_main.py
++++ b/verl/experimental/fully_async_policy/fully_async_main.py
+@@ -116,7 +116,10 @@ class FullyAsyncTaskRunner:
+ 
+     def _create_rollouter(self, config) -> None:
+         print("[ASYNC MAIN] Starting create rollouter...")
+-        rollouter = FullyAsyncRollouter.remote(
++        rollouter_actor_name = config.async_training.get("rollouter_actor_name", "fully_async_rollouter")
++        rollouter_cls = FullyAsyncRollouter.options(name=rollouter_actor_name)
++
++        rollouter = rollouter_cls.remote(
+             config=config,
+             tokenizer=self.components["tokenizer"],
+             role_worker_mapping=None,
+@@ -130,7 +133,7 @@ class FullyAsyncTaskRunner:
+         ray.get(rollouter.set_max_required_samples.remote())
+ 
+         self.components["rollouter"] = rollouter
+-        print("[ASYNC MAIN] Rollouter created and initialized successfully")
++        print(f"[ASYNC MAIN] Rollouter created and initialized successfully, name={rollouter_actor_name}")
+ 
+     def _create_trainer(self, config) -> None:
+         print("[ASYNC MAIN] Starting create trainer...")
+@@ -140,7 +143,10 @@ class FullyAsyncTaskRunner:
+             if role != Role.Rollout
+         }
+ 
+-        trainer = FullyAsyncTrainer.remote(
++        trainer_actor_name = config.async_training.get("trainer_actor_name", "fully_async_trainer")
++        trainer_cls = FullyAsyncTrainer.options(name=trainer_actor_name)
++
++        trainer = trainer_cls.remote(
+             config=config,
+             tokenizer=self.components["tokenizer"],
+             role_worker_mapping=trainer_role_mapping,
+@@ -152,7 +158,7 @@ class FullyAsyncTaskRunner:
+ 
+         ray.get(trainer.init_workers.remote())
+         self.components["trainer"] = trainer
+-        print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
++        print(f"[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully, name={trainer_actor_name}")
+ 
+     def _run_training_loop(self):
+         self.running = True
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+index fdde54a6..6414f2f8 100644
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -167,6 +167,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         # Modified by self.pause() or self._should_pause_generation()
+         self.paused = False
+         self.running = True
++        self.rollout_enabled = True
++        self.disabled_replica_ids = set()
+ 
+         # Add dataloader lock
+         self.dataloader_lock = asyncio.Lock()
+@@ -234,6 +236,175 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+     def get_total_train_steps(self):
+         return self.total_train_steps
+ 
++    def _is_rollout_manager_ready(self) -> bool:
++        return self.async_rollout_manager is not None
++
++    async def scale_up_replicas(self, num_replicas: int = 1) -> dict:
++        """Dynamically add rollout replicas and refresh routing/concurrency."""
++        if num_replicas <= 0:
++            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
++        if not self._is_rollout_manager_ready():
++            raise RuntimeError(
++                "async_rollout_manager is not initialized yet. Wait for init_workers() to complete "
++                "and ensure rollout startup did not fail."
++            )
++
++        scaling_from_paused_state = self.paused
++        async with self.lock:
++            self.paused = True
++
++        while self.active_tasks:
++            done_tasks, self.active_tasks = await asyncio.wait(self.active_tasks, return_when=asyncio.FIRST_COMPLETED)
++            for task in done_tasks:
++                await task
++
++        scale_stats = await self.async_rollout_manager.add_replicas(num_replicas=num_replicas)
++
++        async with self.lock:
++            if self.rollout_enabled and not scaling_from_paused_state:
++                self.paused = False
++                self.condition.notify_all()
++
++            self.max_concurrent_samples = min(scale_stats["num_active_replicas"] * 16, self.max_required_samples)
++
++        return {
++            "rollout_enabled": self.rollout_enabled,
++            "paused": self.paused,
++            "max_concurrent_samples": self.max_concurrent_samples,
++            **scale_stats,
++        }
++
++    async def set_rollout_enabled(self, enabled: bool) -> dict:
++        """Enable/disable rollout generation globally.
++
++        When disabled, all rollout replicas pause generation and feeder/processor loops
++        are blocked by `self.paused`. When enabled, only replicas not explicitly disabled
++        via `set_rollout_replica_enabled` are resumed.
++        """
++        async with self.lock:
++            self.rollout_enabled = enabled
++            self.paused = not enabled
++            if enabled:
++                self.condition.notify_all()
++
++        if not self._is_rollout_manager_ready():
++            return {
++                "rollout_enabled": self.rollout_enabled,
++                "paused": self.paused,
++                "disabled_replica_ids": sorted(self.disabled_replica_ids),
++                "manager_ready": False,
++                "message": "async_rollout_manager is not initialized yet",
++            }
++
++        replicas = self.async_rollout_manager.rollout_replicas
++        if enabled:
++            active_replica_ids = [i for i in range(len(replicas)) if i not in self.disabled_replica_ids]
++            if not active_replica_ids:
++                raise ValueError("No active rollout replicas left to enable. Re-enable at least one replica first.")
++
++            # Resume only active replicas and update routing to avoid sending traffic to disabled replicas.
++            await asyncio.gather(*[replicas[i].resume_generation() for i in active_replica_ids])
++            routing_stats = await self.async_rollout_manager.update_active_replicas(active_replica_ids)
++        else:
++            # Abort all in-flight/new requests immediately for global pause.
++            await asyncio.gather(*[replica.abort_all_requests() for replica in replicas])
++            routing_stats = {
++                "num_active_replicas": 0,
++                "num_total_replicas": len(replicas),
++                "num_workers": len(self.async_rollout_manager.agent_loop_workers),
++            }
++
++        async with self.lock:
++            active_servers = routing_stats["num_active_replicas"]
++            if active_servers > 0:
++                self.max_concurrent_samples = min(active_servers * 16, self.max_required_samples)
++            else:
++                self.max_concurrent_samples = 0
++
++        return {
++            "rollout_enabled": self.rollout_enabled,
++            "paused": self.paused,
++            "disabled_replica_ids": sorted(self.disabled_replica_ids),
++            **routing_stats,
++        }
++
++    async def set_rollout_replica_enabled(self, replica_id: int, enabled: bool) -> dict:
++        """Enable/disable a single rollout replica and refresh request routing."""
++        if not self._is_rollout_manager_ready():
++            raise RuntimeError(
++                "async_rollout_manager is not initialized yet. Wait for init_workers() to complete "
++                "and ensure rollout startup did not fail."
++            )
++
++        replicas = self.async_rollout_manager.rollout_replicas
++        if replica_id < 0 or replica_id >= len(replicas):
++            raise ValueError(f"replica_id {replica_id} out of range [0, {len(replicas) - 1}]")
++
++        if enabled:
++            self.disabled_replica_ids.discard(replica_id)
++            if self.rollout_enabled:
++                await replicas[replica_id].resume_generation()
++        else:
++            self.disabled_replica_ids.add(replica_id)
++            await replicas[replica_id].abort_all_requests()
++
++        active_replica_ids = [i for i in range(len(replicas)) if i not in self.disabled_replica_ids]
++
++        if self.rollout_enabled and not active_replica_ids:
++            # Roll back to keep at least one active replica when rollout is enabled.
++            self.disabled_replica_ids.discard(replica_id)
++            if not enabled:
++                await replicas[replica_id].resume_generation()
++            raise ValueError("Cannot disable all replicas while rollout is enabled.")
++
++        if self.rollout_enabled:
++            routing_stats = await self.async_rollout_manager.update_active_replicas(active_replica_ids)
++            async with self.lock:
++                self.max_concurrent_samples = min(routing_stats["num_active_replicas"] * 16, self.max_required_samples)
++        else:
++            routing_stats = {
++                "num_active_replicas": len(active_replica_ids),
++                "num_total_replicas": len(replicas),
++                "num_workers": len(self.async_rollout_manager.agent_loop_workers),
++            }
++
++        return {
++            "rollout_enabled": self.rollout_enabled,
++            "paused": self.paused,
++            "replica_id": replica_id,
++            "replica_enabled": enabled,
++            "disabled_replica_ids": sorted(self.disabled_replica_ids),
++            **routing_stats,
++        }
++
++    async def get_rollout_control_state(self) -> dict:
++        """Return current rollout control state for external monitoring."""
++        if not self._is_rollout_manager_ready():
++            return {
++                "rollout_enabled": self.rollout_enabled,
++                "paused": self.paused,
++                "manager_ready": False,
++                "num_total_replicas": 0,
++                "num_active_replicas": 0,
++                "active_replica_ids": [],
++                "disabled_replica_ids": sorted(self.disabled_replica_ids),
++                "max_concurrent_samples": self.max_concurrent_samples,
++                "message": "async_rollout_manager is not initialized yet",
++            }
++
++        replica_count = len(self.async_rollout_manager.rollout_replicas)
++        active_replica_ids = [i for i in range(replica_count) if i not in self.disabled_replica_ids]
++        return {
++            "rollout_enabled": self.rollout_enabled,
++            "paused": self.paused,
++            "manager_ready": True,
++            "num_total_replicas": replica_count,
++            "num_active_replicas": len(active_replica_ids),
++            "active_replica_ids": active_replica_ids,
++            "disabled_replica_ids": sorted(self.disabled_replica_ids),
++            "max_concurrent_samples": self.max_concurrent_samples,
++        }
++
+     async def reset_staleness(self):
+         """
+         Reset staleness samples after parameter update.
+@@ -405,6 +576,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+             full_batch = prepare_single_generation_data(batch_dict, self.config)
+ 
+             sample_id = f"sample_{epoch}_{self.global_steps}"
++            full_batch.non_tensor_batch["rollout_trace_id"] = np.array([sample_id] * len(full_batch), dtype=object)
+ 
+             rollout_sample = RolloutSample(
+                 full_batch=full_batch,
+diff --git a/verl/experimental/fully_async_policy/fully_async_trainer.py b/verl/experimental/fully_async_policy/fully_async_trainer.py
+index e9728064..36ecf86f 100644
+--- a/verl/experimental/fully_async_policy/fully_async_trainer.py
++++ b/verl/experimental/fully_async_policy/fully_async_trainer.py
+@@ -139,6 +139,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
+         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
+         self.last_ckpt_version = 0
+         self.train_role = Role.ActorRollout if config.async_training.use_trainer_do_validate else Role.Actor
++        self.train_trajectory_log_limit = int(os.getenv("VERL_TRAIN_TRAJECTORY_LOG_LIMIT", "8"))
++        self.train_log_text_limit = int(os.getenv("VERL_TRAIN_TRAJECTORY_TEXT_LIMIT", "240"))
+ 
+         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
+         self.require_batches = config.async_training.require_batches
+@@ -205,6 +207,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
+         # Setup checkpoint manager after rollouter is set
+         self._setup_checkpoint_manager(rollouter)
+ 
++    async def scale_up_rollout_replicas(self, num_replicas: int = 1):
++        """Dynamically add rollout replicas and sync current weights to them."""
++        if self.rollouter is None:
++            raise ValueError("rollouter not set. Call set_rollouter() first.")
++        if num_replicas <= 0:
++            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
++
++        scale_stats = await self.rollouter.scale_up_replicas.remote(num_replicas)
++        new_replicas = ray.get(self.rollouter.get_replicas.remote())[-num_replicas:]
++        self.checkpoint_manager.add_replicas(new_replicas)
++        await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
++
++        return {
++            "current_param_version": self.current_param_version,
++            "num_total_checkpoint_replicas": len(self.checkpoint_manager.replicas),
++            **scale_stats,
++        }
++
+     def set_total_train_steps(self, total_training_steps):
+         self.total_train_steps = total_training_steps
+ 
+@@ -224,6 +244,77 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
+         """Get actor worker group"""
+         return self.actor_wg
+ 
++    @staticmethod
++    def _extract_non_tensor_value(arr, index: int):
++        if arr is None:
++            return None
++        try:
++            return arr[index]
++        except Exception:
++            return None
++
++    def _truncate_text(self, value: Any) -> str:
++        text = "" if value is None else str(value)
++        if len(text) <= self.train_log_text_limit:
++            return text
++        return text[: self.train_log_text_limit] + "..."
++
++    def _decode_response_tokens(self, token_ids: list[int]) -> str:
++        try:
++            return self.tokenizer.decode(token_ids, skip_special_tokens=True)
++        except Exception:
++            return f"<decode_failed len={len(token_ids)}>"
++
++    def _log_consumed_trajectories(self, queue_samples: list[Any]):
++        """Print a compact summary of trajectories consumed by trainer with rollout-server correlation."""
++        max_logs = self.train_trajectory_log_limit
++        printed = 0
++
++        for rollout_sample in queue_samples:
++            if printed >= max_logs:
++                break
++            batch = rollout_sample.full_batch
++            batch_size = len(batch)
++            prompt_len = batch.batch["prompts"].shape[1]
++
++            for i in range(batch_size):
++                if printed >= max_logs:
++                    break
++                uid = self._extract_non_tensor_value(batch.non_tensor_batch.get("uid"), i)
++                trace_id = self._extract_non_tensor_value(batch.non_tensor_batch.get("rollout_trace_id"), i)
++                server_id = self._extract_non_tensor_value(batch.non_tensor_batch.get("rollout_server_id"), i)
++                request_id = self._extract_non_tensor_value(batch.non_tensor_batch.get("rollout_request_id"), i)
++                backend_request_id = self._extract_non_tensor_value(
++                    batch.non_tensor_batch.get("rollout_backend_request_id"), i
++                )
++                raw_prompt = self._extract_non_tensor_value(batch.non_tensor_batch.get("raw_prompt"), i)
++
++                attention = batch.batch["attention_mask"][i]
++                response_valid_len = int(attention[prompt_len:].sum().item())
++                response_ids = batch.batch["responses"][i][:response_valid_len].tolist()
++                response_text = self._decode_response_tokens(response_ids)
++
++                print(
++                    "[FullyAsyncTrainer][TrajectoryConsumed] "
++                    f"sample_id={rollout_sample.sample_id} "
++                    f"epoch={rollout_sample.epoch} "
++                    f"uid={uid} "
++                    f"trace_id={trace_id} "
++                    f"server_id={server_id} "
++                    f"request_id={request_id} "
++                    f"backend_request_id={backend_request_id} "
++                    f"prompt={self._truncate_text(raw_prompt)} "
++                    f"response={self._truncate_text(response_text)}"
++                )
++                printed += 1
++
++        if len(queue_samples) > 0:
++            print(
++                "[FullyAsyncTrainer][TrajectoryConsumed] "
++                f"printed={printed}, total_rollout_samples={len(queue_samples)}, "
++                f"log_limit={max_logs}"
++            )
++
+     async def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
+         """
+         Get samples from message queue and compose gen_batch_output
+@@ -274,6 +365,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
+         )
+ 
+         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
++        self._log_consumed_trajectories(queue_samples)
+         # Assemble batch - now working directly with RolloutSample objects
+         if self.config.trainer.balance_batch:
+             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index b58d96bc..fa2e88e1 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -514,6 +514,16 @@ class vLLMHttpServer:
+     ) -> TokenOutput:
+         """Generate sequence with token-in-token-out."""
+         prompt_ids = normalize_token_ids(prompt_ids)
++        logger.info(
++            "[vLLMAsyncServer][request] replica_rank=%s node_rank=%s server=%s:%s request_id=%s prompt_tokens=%d prompt_token_ids_head=%s",
++            self.replica_rank,
++            self.node_rank,
++            self._server_address,
++            self._server_port,
++            request_id,
++            len(prompt_ids),
++            prompt_ids[:20],
++        )
+ 
+         # Calculate the maximum possible new tokens based on available context space
+         # This serves as a safety upper bound
+@@ -603,6 +613,18 @@ class vLLMHttpServer:
+         if hasattr(final_res.outputs[0], "num_preempted"):
+             num_preempted = final_res.outputs[0].num_preempted
+ 
++        logger.info(
++            "[vLLMAsyncServer][response] replica_rank=%s node_rank=%s server=%s:%s request_id=%s stop_reason=%s response_tokens=%d response_token_ids_head=%s",
++            self.replica_rank,
++            self.node_rank,
++            self._server_address,
++            self._server_port,
++            request_id,
++            stop_reason,
++            len(token_ids),
++            token_ids[:20],
++        )
++
+         return TokenOutput(
+             token_ids=token_ids,
+             log_probs=log_probs,
