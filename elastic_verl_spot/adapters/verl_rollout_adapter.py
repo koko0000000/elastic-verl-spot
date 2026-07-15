@@ -12,7 +12,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from elastic_verl_spot.rollout.request_store import InMemoryRequestStore
 from elastic_verl_spot.rollout.state_machine import RolloutReplicaStateMachine
+from elastic_verl_spot.rollout.trajectory_store import InMemoryTrajectoryStore
 
 
 class JsonlElasticRolloutLogger:
@@ -57,6 +61,12 @@ def _request_ids_with_sample_index(batch: Any) -> list[str]:
         seen[base_id] = sample_index + 1
         request_ids.append(f"{base_id}:sample-{sample_index}")
     return request_ids
+
+
+def _inject_elastic_request_ids(batch: Any, request_ids: list[str]) -> None:
+    """Attach stable request ids so verl agent loops can forward them to runtime hooks."""
+
+    batch.non_tensor_batch["elastic_request_id"] = np.array(request_ids, dtype=object)
 
 
 def _record_replica_removed_state(
@@ -156,6 +166,9 @@ def generate_sequences_with_elastic_events(
 
     logger = JsonlElasticRolloutLogger(event_log_path)
     request_ids = _request_ids_with_sample_index(batch)
+    _inject_elastic_request_ids(batch, request_ids)
+    request_store = InMemoryRequestStore()
+    trajectory_store = InMemoryTrajectoryStore()
     dry_run_fail_after = int(_get_cfg(elastic_config, "dry_run_fail_after_dispatches", -1))
     dry_run_fail_worker = str(_get_cfg(elastic_config, "dry_run_fail_worker_id", "rollout-0"))
     fault_injection_enable = bool(_get_cfg(elastic_config, "fault_injection_enable", False))
@@ -177,7 +190,10 @@ def generate_sequences_with_elastic_events(
         dry_run=not fault_injection_enable,
     )
     for idx, request_id in enumerate(request_ids, start=1):
+        request_store.submit(request_id)
+        trajectory_store.upsert_partial(request_id, trajectory_id=request_id)
         logger.emit("request_submitted", global_steps=global_steps, request_id=request_id)
+        request_store.mark_running(request_id, worker_id="native_verl_rollout")
         logger.emit(
             "request_dispatched",
             global_steps=global_steps,
@@ -284,6 +300,8 @@ def generate_sequences_with_elastic_events(
         done_request_ids.extend(_request_ids_with_sample_index(output)[len(done_request_ids) :])
 
     for request_id in done_request_ids:
+        request_store.mark_done(request_id)
+        trajectory_store.mark_done(request_id)
         logger.emit(
             "request_done",
             global_steps=global_steps,
@@ -311,6 +329,8 @@ def generate_sequences_with_elastic_events(
             "event_log_path": str(event_log_path),
             "submitted": len(request_ids),
             "completed": len(done_request_ids),
+            "request_store_records": len(request_store.all()),
+            "trajectory_store_records": len(trajectory_store.all()),
         }
     )
     output.meta_info.setdefault("timing", {})

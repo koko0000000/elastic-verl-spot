@@ -24,17 +24,52 @@ class RequestStatus(str, Enum):
 
 
 @dataclass
+class KVCacheMetadata:
+    """CPU-side metadata for a saved rollout KV cache segment."""
+
+    cache_key: str
+    model_version: int | None = None
+    token_count: int = 0
+    worker_id: str | None = None
+    location: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time)
+
+    def as_event_fields(self) -> dict[str, Any]:
+        """Return JSON-serializable fields for event logs."""
+
+        return {
+            "cache_key": self.cache_key,
+            "model_version": self.model_version,
+            "token_count": self.token_count,
+            "worker_id": self.worker_id,
+            "location": self.location,
+            "extra": self.extra,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
 class RolloutRequest:
     """Serializable rollout request state."""
 
     request_id: str
+    engine_request_ids: list[str] = field(default_factory=list)
     prompt: str | None = None
+    prompt_tokens: list[int] = field(default_factory=list)
+    sampling_params: dict[str, Any] = field(default_factory=dict)
     model_version: int | None = None
     status: RequestStatus = RequestStatus.PENDING
     worker_id: str | None = None
     attempt: int = 0
     partial_tokens: list[int] = field(default_factory=list)
+    partial_token_count: int = 0
+    partial_text: str | None = None
     response_tokens: list[int] = field(default_factory=list)
+    response_token_count: int = 0
+    response_text: str | None = None
+    kv_cache: KVCacheMetadata | None = None
+    trajectory_id: str | None = None
     error: str | None = None
     created_at: float = field(default_factory=time)
     updated_at: float = field(default_factory=time)
@@ -54,8 +89,12 @@ class RolloutRequest:
             "worker_id": self.worker_id,
             "attempt": self.attempt,
             "retried": self.retried,
-            "partial_tokens": len(self.partial_tokens),
-            "response_tokens": len(self.response_tokens),
+            "engine_request_ids": list(self.engine_request_ids),
+            "partial_tokens": self.partial_token_count,
+            "response_tokens": self.response_token_count,
+            "has_kv_cache": self.kv_cache is not None,
+            "kv_cache_tokens": self.kv_cache.token_count if self.kv_cache else 0,
+            "trajectory_id": self.trajectory_id,
             "error": self.error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -73,18 +112,41 @@ class InMemoryRequestStore:
         request_id: str,
         *,
         prompt: str | None = None,
+        prompt_tokens: list[int] | None = None,
+        sampling_params: dict[str, Any] | None = None,
         model_version: int | None = None,
     ) -> RolloutRequest:
         """Create or return a pending request."""
 
         request = self._requests.get(request_id)
         if request is None:
-            request = RolloutRequest(request_id=request_id, prompt=prompt, model_version=model_version)
+            request = RolloutRequest(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_tokens=list(prompt_tokens or []),
+                sampling_params=dict(sampling_params or {}),
+                model_version=model_version,
+            )
             self._requests[request_id] = request
+        else:
+            if prompt is not None:
+                request.prompt = prompt
+            if prompt_tokens is not None:
+                request.prompt_tokens = list(prompt_tokens)
+            if sampling_params is not None:
+                request.sampling_params = dict(sampling_params)
+            if model_version is not None:
+                request.model_version = model_version
         request.updated_at = time()
         return request
 
-    def mark_running(self, request_id: str, worker_id: str) -> RolloutRequest:
+    def mark_running(
+        self,
+        request_id: str,
+        worker_id: str,
+        *,
+        engine_request_id: str | None = None,
+    ) -> RolloutRequest:
         """Mark a request as assigned to a worker."""
 
         request = self._require(request_id)
@@ -92,33 +154,124 @@ class InMemoryRequestStore:
         request.worker_id = worker_id
         request.attempt += 1
         request.error = None
+        if engine_request_id is not None:
+            request.engine_request_ids.append(engine_request_id)
         request.updated_at = time()
         return request
 
-    def save_partial(self, request_id: str, token_ids: list[int]) -> RolloutRequest:
+    def bind_engine_request(self, request_id: str, engine_request_id: str) -> RolloutRequest:
+        """Bind an internal engine request id to the stable rollout request id."""
+
+        request = self._require(request_id)
+        if engine_request_id not in request.engine_request_ids:
+            request.engine_request_ids.append(engine_request_id)
+        request.updated_at = time()
+        return request
+
+    def save_partial(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        *,
+        text: str | None = None,
+        token_count: int | None = None,
+    ) -> RolloutRequest:
         """Persist partial generated tokens for retry or audit."""
 
         request = self._require(request_id)
         request.partial_tokens = list(token_ids)
+        request.partial_token_count = len(token_ids) if token_count is None else token_count
+        if text is not None:
+            request.partial_text = text
         request.updated_at = time()
         return request
 
-    def mark_retrying(self, request_id: str, *, error: str | None = None) -> RolloutRequest:
+    def append_partial(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        *,
+        text_delta: str | None = None,
+        token_count: int | None = None,
+    ) -> RolloutRequest:
+        """Append newly streamed partial tokens to a request."""
+
+        request = self._require(request_id)
+        request.partial_tokens.extend(token_ids)
+        request.partial_token_count = (
+            len(request.partial_tokens) if token_count is None else request.partial_token_count + token_count
+        )
+        if text_delta:
+            request.partial_text = (request.partial_text or "") + text_delta
+        request.updated_at = time()
+        return request
+
+    def save_kv_cache(
+        self,
+        request_id: str,
+        *,
+        cache_key: str,
+        model_version: int | None = None,
+        token_count: int = 0,
+        worker_id: str | None = None,
+        location: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> RolloutRequest:
+        """Persist metadata for a replayable KV cache segment."""
+
+        request = self._require(request_id)
+        request.kv_cache = KVCacheMetadata(
+            cache_key=cache_key,
+            model_version=model_version if model_version is not None else request.model_version,
+            token_count=token_count,
+            worker_id=worker_id,
+            location=location,
+            extra=dict(extra or {}),
+        )
+        request.updated_at = time()
+        return request
+
+    def attach_trajectory(self, request_id: str, trajectory_id: str) -> RolloutRequest:
+        """Associate a request with a trajectory record."""
+
+        request = self._require(request_id)
+        request.trajectory_id = trajectory_id
+        request.updated_at = time()
+        return request
+
+    def mark_retrying(
+        self,
+        request_id: str,
+        *,
+        error: str | None = None,
+        preserve_worker: bool = False,
+    ) -> RolloutRequest:
         """Put a failed in-flight request back into retry state."""
 
         request = self._require(request_id)
         request.status = RequestStatus.RETRYING
-        request.worker_id = None
+        if not preserve_worker:
+            request.worker_id = None
         request.error = error
         request.updated_at = time()
         return request
 
-    def mark_done(self, request_id: str, token_ids: list[int] | None = None) -> RolloutRequest:
+    def mark_done(
+        self,
+        request_id: str,
+        token_ids: list[int] | None = None,
+        *,
+        text: str | None = None,
+        token_count: int | None = None,
+    ) -> RolloutRequest:
         """Mark a request as successfully completed."""
 
         request = self._require(request_id)
         request.status = RequestStatus.DONE
         request.response_tokens = list(token_ids or [])
+        request.response_token_count = len(request.response_tokens) if token_count is None else token_count
+        if text is not None:
+            request.response_text = text
         request.error = None
         request.updated_at = time()
         return request
@@ -147,4 +300,3 @@ class InMemoryRequestStore:
         if request is None:
             raise KeyError(f"unknown rollout request: {request_id}")
         return request
-

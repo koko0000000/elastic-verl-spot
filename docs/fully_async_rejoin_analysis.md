@@ -362,3 +362,59 @@ cache tensors, model weights, or large trajectory payloads.
 5. How should patch trace fields map to `request_id` and `engine_request_id`?
 6. Should the first integration target `fully_async_policy` only, or also the
    current `main_ppo.py` GRPO experiment path?
+
+## 11. First Functional Merge
+
+The first functional merge does not apply the full verl patch. Instead, it
+extracts the reusable control-plane semantics into:
+
+```text
+elastic_verl_spot/rollout/lifecycle_manager.py
+tests/test_rollout_lifecycle_manager.py
+```
+
+This provides a system-side interface for:
+
+```text
+register_replicas()
+disable_replica()
+enable_replica()
+scale_up()
+update_model_version()
+control_state()
+```
+
+Expected event flow for disabling and re-enabling a replica:
+
+```text
+rollout_replicas_registered
+worker_disabled
+checkpoint_replica_removed
+load_balancer_updated
+worker_rebuilding
+checkpoint_weight_synced
+worker_rejoined
+load_balancer_updated
+```
+
+Expected event flow for scale-up:
+
+```text
+worker_rebuilding
+checkpoint_weight_synced
+worker_rejoined
+load_balancer_updated
+rollout_replicas_scaled_up
+```
+
+Local validation:
+
+```powershell
+cd "D:\research\elastic verl\elastic-verl-spot"
+python -m pytest tests\test_rollout_lifecycle_manager.py -q
+python -m pytest tests -q
+```
+
+The next integration step is to make the thin verl fully-async hook call this
+manager when `set_rollout_replica_enabled()` or `scale_up_rollout_replicas()` is
+invoked.
